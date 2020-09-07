@@ -68,6 +68,7 @@ func runWeb(mux *http.ServeMux, logger log.Logger, db *tsdb.DB) error {
 
 	api := api.New(log.With(logger, "component", "pprofui"), db)
 	router.GET("/api/v1/query_range", api.QueryRange)
+	router.POST("/api/v1/prometheus_remote_read", api.RemoteRead)
 
 	router.NotFound = http.FileServer(web.Assets)
 

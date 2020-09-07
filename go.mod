@@ -6,7 +6,7 @@ require (
 	github.com/conprof/tsdb v0.8.1-0.20190522132737-ee822c001f9a
 	github.com/go-kit/kit v0.8.0
 	github.com/google/pprof v0.0.0-20190515194954-54271f7e092f
-	github.com/ianlancetaylor/demangle v0.0.0-20181102032728-5e5cf60278f6 // indirect
+	github.com/ianlancetaylor/demangle v0.0.0-20181102032728-5e5cf60278f6
 	github.com/julienschmidt/httprouter v1.2.0
 	github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223
 	github.com/oklog/run v1.0.0

@@ -66,3 +66,8 @@ docker-push:
 	@echo ">> pushing image"
 	@docker tag "${DOCKER_IMAGE_NAME}" quay.io/conprof/"$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)"
 	@docker push quay.io/conprof/"$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)"
+
+pprof:
+	rm -rf pprof
+	cp -r vendor/github.com/google/pprof/internal pprof
+	find pprof -type f -exec sed -i 's/github.com\/google\/pprof\/internal/github.com\/conprof\/conprof\/pprof/g' {} +

@@ -20,13 +20,16 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/conprof/conprof/remoteread"
 	"github.com/conprof/tsdb"
 	tsdbLabels "github.com/conprof/tsdb/labels"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/julienschmidt/httprouter"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/storage/remote"
 )
 
 type API struct {
@@ -146,4 +149,67 @@ func convertMatcher(m *labels.Matcher) tsdbLabels.Matcher {
 		return tsdbLabels.Not(res)
 	}
 	panic("storage.convertMatcher: invalid matcher type")
+}
+
+func (a *API) RemoteRead(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	req, err := remote.DecodeReadRequest(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	resp := &prompb.ReadResponse{
+		Results: make([]*prompb.QueryResult, len(req.Queries)),
+	}
+
+	for j, query := range req.Queries {
+		q, err := a.db.Querier(query.StartTimestampMs, query.EndTimestampMs)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		m := make([]tsdbLabels.Matcher, len(query.Matchers))
+		for i, matcher := range query.Matchers {
+			var match tsdbLabels.Matcher
+			switch t := matcher.Type; t {
+			case prompb.LabelMatcher_EQ:
+				match = tsdbLabels.NewEqualMatcher(matcher.Name, matcher.Value)
+			case prompb.LabelMatcher_NEQ:
+				match = tsdbLabels.Not(tsdbLabels.NewEqualMatcher(matcher.Name, matcher.Value))
+			case prompb.LabelMatcher_RE:
+				match, err = tsdbLabels.NewRegexpMatcher(matcher.Name, matcher.Value)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+					return
+				}
+			case prompb.LabelMatcher_NRE:
+				match = tsdbLabels.NewEqualMatcher(matcher.Name, matcher.Value)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+					return
+				}
+				match = tsdbLabels.Not(match)
+			default:
+				http.Error(w, "Bad Request: unknown matcher type", http.StatusBadRequest)
+				return
+			}
+			m[i] = match
+		}
+
+		s, err := q.Select(m...)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		ts, err := remoteread.Convert(s)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
+			return
+		}
+		resp.Results[j] = &prompb.QueryResult{Timeseries: ts}
+	}
+
+	remote.EncodeReadResponse(resp, w)
 }
