@@ -17,6 +17,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/conprof/db/storage"
 	"github.com/conprof/db/tsdb"
 	"github.com/conprof/db/tsdb/wal"
 	"github.com/go-kit/kit/log"
@@ -28,6 +29,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
@@ -139,37 +141,8 @@ func runAll(
 	objStoreConfig extflag.PathOrContent,
 	srv *grpcSettings,
 ) (prober.Probe, error) {
-	db, err := tsdb.Open(
-		storagePath,
-		logger,
-		prometheus.DefaultRegisterer,
-		&tsdb.Options{
-			RetentionDuration:      retention.Milliseconds(),
-			WALSegmentSize:         wal.DefaultSegmentSize,
-			MinBlockDuration:       tsdb.DefaultBlockDuration,
-			MaxBlockDuration:       retention.Milliseconds() / 10,
-			NoLockfile:             true,
-			AllowOverlappingBlocks: false,
-			WALCompression:         true,
-			StripeSize:             tsdb.DefaultStripeSize,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	scrapeManager := scrape.NewManager(log.With(logger, "component", "scrape-manager"), db)
-
-	sampler, err := NewSampler(db, reloaders,
-		SamplerScraper(scrapeManager),
-		SamplerConfig(configFile),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if err := sampler.Run(context.TODO(), g, reloadCh); err != nil {
-		return nil, err
-	}
+	lazyDBOpener := &lazyDB{}
+	scrapeManager := scrape.NewManager(log.With(logger, "component", "scrape-manager"), lazyDBOpener)
 
 	confContentYaml, err := objStoreConfig.Content()
 	if err != nil {
@@ -200,7 +173,7 @@ func runAll(
 		sym = symbol.NewSymbolizer(logger, symStore)
 	}
 
-	w := NewWeb(mux, db, maxMergeBatchSize, queryTimeout,
+	w := NewWeb(mux, lazyDBOpener, maxMergeBatchSize, queryTimeout,
 		WebLogger(logger),
 		WebRegistry(reg),
 		WebReloaders(reloaders),
@@ -221,7 +194,7 @@ func runAll(
 		prober.NewInstrumentation(comp, logger, extprom.WrapRegistererWithPrefix("conprof_", reg)),
 	)
 	maxBytesPerFrame := 1024 * 1024 * 2 // 2 Mb default, might need to be tuned later on.
-	s := store.NewProfileStore(logger, db, maxBytesPerFrame)
+	s := store.NewProfileStore(logger, lazyDBOpener, maxBytesPerFrame)
 
 	gsrv := grpcserver.New(logger, reg, &opentracing.NoopTracer{}, grpcLogOpts, tagOpts, comp, grpcProbe,
 		grpcserver.WithServer(store.RegisterReadableStoreServer(s)),
@@ -241,6 +214,55 @@ func runAll(
 		),
 	)
 
+	ctx, cancelSampler := context.WithCancel(context.Background())
+
+	g.Add(func() error {
+		db, err := tsdb.Open(
+			storagePath,
+			logger,
+			prometheus.DefaultRegisterer,
+			&tsdb.Options{
+				RetentionDuration:      retention.Milliseconds(),
+				WALSegmentSize:         wal.DefaultSegmentSize,
+				MinBlockDuration:       tsdb.DefaultBlockDuration,
+				MaxBlockDuration:       retention.Milliseconds() / 10,
+				NoLockfile:             true,
+				AllowOverlappingBlocks: false,
+				WALCompression:         true,
+				StripeSize:             tsdb.DefaultStripeSize,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		lazyDBOpener.appender = db
+		lazyDBOpener.queryable = db
+		lazyDBOpener.chunks = db
+
+		sampler, err := NewSampler(db, reloaders,
+			SamplerScraper(scrapeManager),
+			SamplerConfig(configFile),
+		)
+		if err != nil {
+			return err
+		}
+
+		if err := sampler.Run(ctx, g, reloadCh); err != nil {
+			return err
+		}
+
+		// TODO: Don't pass *run.Group but rather run individual ones so we don't need this trickery
+		// block this group until it's supposed to finish
+		select {
+		case <-ctx.Done():
+			return nil
+		}
+	}, func(err error) {
+		cancelSampler()
+		level.Error(logger).Log("msg", "failed to start conprof components", "err", err)
+	})
+
 	g.Add(func() error {
 		statusProber.Ready()
 		return gsrv.ListenAndServe()
@@ -250,4 +272,62 @@ func runAll(
 	})
 
 	return statusProber, nil
+}
+
+// lazyDB is a shim that returns noop implementations for TSDB interfaces until the actual TSDB is opened.
+type lazyDB struct {
+	appender  scrape.Appendable
+	queryable storage.Queryable
+	chunks    storage.ChunkQueryable
+}
+
+func (l *lazyDB) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+	if l.queryable == nil {
+		return storage.NoopQuerier(), nil
+	}
+	return l.queryable.Querier(ctx, mint, maxt)
+}
+
+func (l *lazyDB) Appender(ctx context.Context) storage.Appender {
+	if l.appender == nil {
+		return &noopAppender{}
+	}
+	return l.appender.Appender(ctx)
+}
+
+func (l *lazyDB) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+	if l.chunks == nil {
+		return &noopChunkQuerier{}, nil
+	}
+	return l.chunks.ChunkQuerier(ctx, mint, maxt)
+}
+
+// TODO: Might make sense to move next to the storage.NoopQuerier
+
+type noopAppender struct{}
+
+func (n noopAppender) Add(l labels.Labels, t int64, v []byte) (uint64, error) { return 0, nil }
+
+func (n noopAppender) AddFast(ref uint64, t int64, v []byte) error { return nil }
+
+func (n noopAppender) Commit() error { return nil }
+
+func (n noopAppender) Rollback() error { return nil }
+
+type noopChunkQuerier struct{}
+
+func (n noopChunkQuerier) LabelValues(name string) ([]string, storage.Warnings, error) {
+	return nil, nil, nil
+}
+
+func (n noopChunkQuerier) LabelNames() ([]string, storage.Warnings, error) {
+	return nil, nil, nil
+}
+
+func (n noopChunkQuerier) Close() error {
+	return nil
+}
+
+func (n noopChunkQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.ChunkSeriesSet {
+	return nil
 }
