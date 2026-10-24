@@ -29,46 +29,105 @@ type SymbolizationInfo struct {
 	Mapping Mapping
 }
 
+// DecodeSymbolizationInfo decodes the address and mapping of an encoded
+// location.
+//
+// Every read is bounds-checked, and a record that runs out mid-field yields
+// whatever had been decoded before it did. It parses bytes handed to it by a
+// caller -- on the ClickHouse ingest path, straight out of an Arrow dictionary
+// buffer -- and there is no recovery interceptor there, so an unchecked index
+// would take the process down rather than fail one request. Reading past the
+// end is not even reliably a crash: an Arrow value's cap runs to the end of
+// the whole buffer, so an over-read can silently return the bytes of the next
+// location instead of panicking.
 func DecodeSymbolizationInfo(data []byte) (SymbolizationInfo, uint64) {
 	offset := 0
-	addr, n := varint.Uvarint(data) // we need to know the address size to read the build ID
-	offset += n
 
-	numberOfLines, n := varint.Uvarint(data[offset:])
-	offset += n
+	// uvarint reports false when the record has run out or the varint is
+	// malformed; Uvarint returns n <= 0 for both.
+	uvarint := func() (uint64, bool) {
+		if offset >= len(data) {
+			return 0, false
+		}
+		v, n := varint.Uvarint(data[offset:])
+		if n <= 0 {
+			return 0, false
+		}
+		offset += n
+		return v, true
+	}
+	// str reads a length-prefixed string. The length is unsigned, so one above
+	// MaxInt converts to a negative int and offset+int(length) lands BELOW
+	// offset -- which slips past a naive upper-bound check straight into a
+	// panicking slice. Compare in the space the length was read in.
+	str := func() ([]byte, bool) {
+		length, ok := uvarint()
+		if !ok || length > uint64(len(data)-offset) {
+			return nil, false
+		}
+		v := data[offset : offset+int(length)]
+		offset += int(length)
+		return v, true
+	}
 
+	// We need to know the address size to read the build ID.
+	addr, ok := uvarint()
+	if !ok {
+		return SymbolizationInfo{}, 0
+	}
+
+	numberOfLines, ok := uvarint()
+	if !ok {
+		return SymbolizationInfo{Addr: addr}, 0
+	}
+
+	if offset >= len(data) {
+		return SymbolizationInfo{Addr: addr}, numberOfLines
+	}
 	hasMapping := data[offset] == 0x1
 	offset++
 
-	if hasMapping {
-		buildID, n := decodeString(data[offset:])
-		offset += n
+	if !hasMapping {
+		return SymbolizationInfo{Addr: addr}, numberOfLines
+	}
 
-		file, n := decodeString(data[offset:])
-		offset += n
-
-		memoryStart, n := varint.Uvarint(data[offset:])
-		offset += n
-
-		memoryLength, n := varint.Uvarint(data[offset:])
-		offset += n
-
-		mappingOffset, _ := varint.Uvarint(data[offset:])
-
+	buildID, ok := str()
+	if !ok {
+		return SymbolizationInfo{Addr: addr}, numberOfLines
+	}
+	file, ok := str()
+	if !ok {
+		return SymbolizationInfo{Addr: addr, BuildID: buildID}, numberOfLines
+	}
+	memoryStart, ok := uvarint()
+	if !ok {
 		return SymbolizationInfo{
 			Addr:    addr,
 			BuildID: buildID,
-			Mapping: Mapping{
-				StartAddr: memoryStart,
-				EndAddr:   memoryStart + memoryLength,
-				Offset:    mappingOffset,
-				File:      string(file),
-			},
+			Mapping: Mapping{File: string(file)},
 		}, numberOfLines
 	}
+	memoryLength, ok := uvarint()
+	if !ok {
+		return SymbolizationInfo{
+			Addr:    addr,
+			BuildID: buildID,
+			Mapping: Mapping{StartAddr: memoryStart, File: string(file)},
+		}, numberOfLines
+	}
+	// The final field is read without a success check on purpose: a zero offset
+	// is the same answer a missing one would give.
+	mappingOffset, _ := uvarint()
 
 	return SymbolizationInfo{
-		Addr: addr,
+		Addr:    addr,
+		BuildID: buildID,
+		Mapping: Mapping{
+			StartAddr: memoryStart,
+			EndAddr:   memoryStart + memoryLength,
+			Offset:    mappingOffset,
+			File:      string(file),
+		},
 	}, numberOfLines
 }
 
