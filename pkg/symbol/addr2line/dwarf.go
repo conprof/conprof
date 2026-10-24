@@ -36,31 +36,48 @@ type DwarfLiner struct {
 	dbgFile   elfutils.DebugInfoFile
 	f         *elf.File
 	filename  string
+
+	// unmapDWARF releases the memory mapping backing debugData. It is nil
+	// when the DWARF sections were loaded into heap buffers instead.
+	unmapDWARF func() error
 }
 
 // DWARF creates a new DwarfLiner.
 func DWARF(logger log.Logger, filename string, f *elf.File, demangler *demangle.Demangler) (*DwarfLiner, error) {
-	debugData, err := f.DWARF()
+	debugData, unmapDWARF, err := elfutils.LoadDWARFData(f, filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read DWARF data: %w", err)
 	}
 
 	dbgFile, err := elfutils.NewDebugInfoFile(debugData, demangler)
 	if err != nil {
+		// Release the mapping if initialization fails half-way.
+		if unmapDWARF != nil {
+			_ = unmapDWARF()
+		}
 		return nil, err
 	}
 
 	return &DwarfLiner{
-		logger:    log.With(logger, "liner", "dwarf"),
-		dbgFile:   dbgFile,
-		debugData: debugData,
-		f:         f,
-		filename:  filename,
+		logger:     log.With(logger, "liner", "dwarf"),
+		dbgFile:    dbgFile,
+		debugData:  debugData,
+		f:          f,
+		filename:   filename,
+		unmapDWARF: unmapDWARF,
 	}, nil
 }
 
 func (dl *DwarfLiner) Close() error {
-	return dl.f.Close()
+	// Release the mmap-backed DWARF sections, if any, before closing the file.
+	var unmapErr error
+	if dl.unmapDWARF != nil {
+		unmapErr = dl.unmapDWARF()
+	}
+	if err := dl.f.Close(); err != nil {
+		return err
+	}
+	return unmapErr
 }
 
 func (dl *DwarfLiner) File() string {
