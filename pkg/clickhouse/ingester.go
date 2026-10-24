@@ -211,6 +211,15 @@ func decodeLineInfo(data []byte) LineInfo {
 		offset += n
 		info.LineNumber = int64(lineNum)
 
+		// Read the column. pprof carries no column information, so
+		// EncodePprofLocation writes a uvarint zero here -- a single 0x00 byte.
+		// Leaving it unread makes the hasFunction read below land on the column
+		// instead of the flag, where it is always false, which silently discards
+		// the function name, system name, filename and start line of every
+		// already-symbolized location.
+		_, n = varint.Uvarint(data[offset:])
+		offset += n
+
 		hasFunction := data[offset] == 0x1
 		offset++
 
